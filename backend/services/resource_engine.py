@@ -2,6 +2,9 @@ def recommend_resources(disaster_type, severity):
 
     recommendations = []
 
+    severity = (severity or "LOW").strip().upper()
+    disaster_type = (disaster_type or "").strip().upper()
+
     if severity == "CRITICAL":
         recommendations.extend([
             "AMBULANCE",

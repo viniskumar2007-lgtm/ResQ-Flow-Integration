@@ -3,6 +3,27 @@ from typing import Any, Dict
 from database import supabase_admin
 
 
+def _find_existing_incident(user_id: str, local_id: str):
+    return (
+        supabase_admin
+        .table("incidents")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("local_id", local_id)
+        .limit(1)
+        .execute()
+    )
+
+
+def _duplicate_result(incident):
+    return {
+        "success": True,
+        "message": "Incident already synchronized",
+        "duplicate": True,
+        "incident": incident,
+    }
+
+
 # ============================================================
 # Offline Incident Synchronization
 # ============================================================
@@ -30,32 +51,20 @@ def sync_incident(
 
     local_id = incident_data.get("local_id")
 
-    if not local_id:
+    if not isinstance(local_id, str) or not local_id.strip():
         raise ValueError(
             "local_id is required for synchronization"
         )
+    local_id = local_id.strip()
 
     # --------------------------------------------------------
-    # Check for duplicate incident
+    # Check for an existing incident owned by this user
     # --------------------------------------------------------
 
-    existing_response = (
-        supabase_admin
-        .table("incidents")
-        .select("*")
-        .eq("local_id", local_id)
-        .limit(1)
-        .execute()
-    )
+    existing_response = _find_existing_incident(user_id, local_id)
 
     if existing_response.data:
-
-        return {
-            "success": True,
-            "message": "Incident already synchronized",
-            "duplicate": True,
-            "incident": existing_response.data[0]
-        }
+        return _duplicate_result(existing_response.data[0])
 
     # --------------------------------------------------------
     # Prepare incident data
@@ -85,12 +94,21 @@ def sync_incident(
     # Insert synchronized incident
     # --------------------------------------------------------
 
-    response = (
-        supabase_admin
-        .table("incidents")
-        .insert(incident)
-        .execute()
-    )
+    try:
+        response = (
+            supabase_admin
+            .table("incidents")
+            .insert(incident)
+            .execute()
+        )
+    except Exception as error:
+        if getattr(error, "code", None) != "23505":
+            raise
+
+        existing_response = _find_existing_incident(user_id, local_id)
+        if existing_response.data:
+            return _duplicate_result(existing_response.data[0])
+        raise
 
     if not response.data:
         raise RuntimeError(
