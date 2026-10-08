@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime
 from typing import Optional
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================
@@ -40,6 +42,11 @@ class SOSCreate(BaseModel):
         min_length=2,
         max_length=100
     )
+    local_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=150
+    )
 
     message: str = Field(
         ...,
@@ -75,13 +82,35 @@ class SOSCreate(BaseModel):
         max_length=20
     )
 
+    @field_validator("name", "message")
+    @classmethod
+    def trim_required_text(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank")
+        return value
+
+    @field_validator("local_id")
+    @classmethod
+    def trim_local_id(cls, value):
+        if value is not None:
+            value = value.strip()
+            if not value:
+                raise ValueError("local_id cannot be blank")
+        return value
+
+    @field_validator("disaster_type")
+    @classmethod
+    def normalize_disaster_type(cls, value):
+        return value.strip().upper() if value else value
+
     @field_validator("severity")
     @classmethod
     def validate_severity(cls, value):
         if value is None:
             return value
 
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_SEVERITIES:
             raise ValueError(
@@ -90,6 +119,12 @@ class SOSCreate(BaseModel):
             )
 
         return value
+
+    @model_validator(mode="after")
+    def validate_coordinate_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
 
 
 # ============================================================
@@ -102,7 +137,7 @@ class IncidentStatusUpdate(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, value):
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_STATUSES:
             raise ValueError(
@@ -138,7 +173,7 @@ class ResourceCreate(BaseModel):
         le=180
     )
 
-    available: bool = True
+    available: bool
 
     contact: Optional[str] = Field(
         default=None,
@@ -148,7 +183,7 @@ class ResourceCreate(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_resource_type(cls, value):
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_RESOURCE_TYPES:
             raise ValueError(
@@ -156,6 +191,14 @@ class ResourceCreate(BaseModel):
                 f"{', '.join(sorted(ALLOWED_RESOURCE_TYPES))}"
             )
 
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def trim_resource_name(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be blank")
         return value
 
 
@@ -192,7 +235,7 @@ class IncidentAnalysis(BaseModel):
         if value is None:
             return value
 
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_SEVERITIES:
             raise ValueError(
@@ -224,7 +267,7 @@ class ResourceRecommendationRequest(BaseModel):
         if value is None:
             return value
 
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_SEVERITIES:
             raise ValueError(
@@ -286,7 +329,20 @@ class SyncSOSRequest(BaseModel):
         max_length=20
     )
 
-    timestamp: Optional[str] = None
+    timestamp: Optional[datetime] = None
+
+    @field_validator("local_id", "name", "message")
+    @classmethod
+    def trim_required_text(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be blank")
+        return value
+
+    @field_validator("disaster_type")
+    @classmethod
+    def normalize_disaster_type(cls, value):
+        return value.strip().upper() if value else value
 
     @field_validator("severity")
     @classmethod
@@ -294,7 +350,7 @@ class SyncSOSRequest(BaseModel):
         if value is None:
             return value
 
-        value = value.upper()
+        value = value.strip().upper()
 
         if value not in ALLOWED_SEVERITIES:
             raise ValueError(
@@ -303,6 +359,12 @@ class SyncSOSRequest(BaseModel):
             )
 
         return value
+
+    @model_validator(mode="after")
+    def validate_coordinate_pair(self):
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
 
 
 # ============================================================
@@ -321,3 +383,11 @@ class LoginRequest(BaseModel):
         min_length=6,
         max_length=128
     )
+
+    @field_validator("email")
+    @classmethod
+    def validate_email_shape(cls, value):
+        value = value.strip()
+        if "@" not in value or value.startswith("@") or value.endswith("@"):
+            raise ValueError("A valid email address is required")
+        return value

@@ -1,14 +1,18 @@
+import logging
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from database import supabase
+from database import supabase, supabase_admin
 
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Authentication Configuration
 # ============================================================
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 # ============================================================
@@ -16,17 +20,22 @@ security = HTTPBearer()
 # ============================================================
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials | None = Depends(security)
 ):
     """
     Validate the Supabase access token and return the
     authenticated user.
     """
 
-    token = credentials.credentials
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     try:
-        response = supabase.auth.get_user(token)
+        response = supabase.auth.get_user(credentials.credentials)
 
         if response.user is None:
             raise HTTPException(
@@ -39,8 +48,8 @@ def get_current_user(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("AUTHENTICATION ERROR:", e)
+    except Exception as exc:
+        logger.warning("Supabase authentication lookup failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -65,7 +74,7 @@ def require_role(*allowed_roles):
     ):
         try:
             response = (
-                supabase
+                supabase_admin
                 .table("profiles")
                 .select("role")
                 .eq("id", current_user.id)
@@ -92,8 +101,8 @@ def require_role(*allowed_roles):
         except HTTPException:
             raise
 
-        except Exception as e:
-            print("ROLE AUTHORIZATION ERROR:", e)
+        except Exception as exc:
+            logger.error("Role lookup failed (%s)", type(exc).__name__)
 
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

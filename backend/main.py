@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,7 +10,6 @@ from schemas import (
     SOSCreate,
     IncidentStatusUpdate,
     ResourceCreate,
-    IncidentAnalysis,
     ResourceRecommendationRequest,
     SyncSOSRequest,
     LoginRequest
@@ -16,6 +17,11 @@ from schemas import (
 
 from services.sync_service import sync_incident
 from services.resource_engine import recommend_resources
+from services.ai_service import analyze_incident as analyze_incident_with_rules
+from services.incident_workflow import can_transition_status
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -81,6 +87,8 @@ ALLOWED_INCIDENT_STATUSES = {
     "RESCUED"
 }
 
+ALLOWED_ROLES = {"VICTIM", "RESCUER", "ADMIN"}
+
 
 ALLOWED_RESOURCE_TYPES = {
     "AMBULANCE",
@@ -90,6 +98,18 @@ ALLOWED_RESOURCE_TYPES = {
     "FOOD",
     "WATER"
 }
+
+
+@app.get("/api/me")
+def get_current_profile(current_user=Depends(get_current_user)):
+    return {
+        "success": True,
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+        },
+        "role": get_user_role(current_user.id),
+    }
 
 
 # ============================================================
@@ -103,7 +123,7 @@ def get_user_role(user_id: str) -> str:
 
     try:
         response = (
-            supabase
+            supabase_admin
             .table("profiles")
             .select("role")
             .eq("id", user_id)
@@ -117,13 +137,19 @@ def get_user_role(user_id: str) -> str:
                 detail="User profile not found"
             )
 
-        return response.data["role"]
+        role = response.data["role"]
+        if role not in ALLOWED_ROLES:
+            raise HTTPException(
+                status_code=403,
+                detail="User profile has an unsupported role"
+            )
+        return role
 
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("GET USER ROLE ERROR:", e)
+    except Exception as exc:
+        logger.error("User-role lookup failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -196,8 +222,8 @@ def login(login_data: LoginRequest):
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("LOGIN ERROR:", e)
+    except Exception as exc:
+        logger.warning("Supabase login failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=401,
@@ -219,6 +245,18 @@ def create_sos(
     """
 
     try:
+        if sos.local_id:
+            result = sync_incident(
+                incident_data=sos.model_dump(mode="json"),
+                user_id=current_user.id,
+            )
+            result["message"] = (
+                "SOS already synchronized"
+                if result["duplicate"]
+                else "SOS created successfully"
+            )
+            return result
+
         incident_data = {
             "user_id": current_user.id,
             "name": sos.name,
@@ -253,8 +291,8 @@ def create_sos(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("CREATE SOS ERROR:", e)
+    except Exception as exc:
+        logger.error("SOS creation failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -293,7 +331,7 @@ def get_incidents(
                 .execute()
             )
 
-        else:
+        elif user_role == "VICTIM":
 
             response = (
                 supabase_admin
@@ -302,6 +340,11 @@ def get_incidents(
                 .eq("user_id", current_user.id)
                 .order("created_at", desc=True)
                 .execute()
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to view incidents"
             )
 
         return {
@@ -313,8 +356,8 @@ def get_incidents(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("GET INCIDENTS ERROR:", e)
+    except Exception as exc:
+        logger.error("Incident list lookup failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -376,8 +419,8 @@ def get_incident(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("GET INCIDENT ERROR:", e)
+    except Exception as exc:
+        logger.error("Incident lookup failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -408,6 +451,28 @@ def update_incident_status(
         )
 
     try:
+        current_response = (
+            supabase_admin
+            .table("incidents")
+            .select("id,status")
+            .eq("id", incident_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not current_response.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found"
+            )
+
+        current_status = current_response.data[0].get("status")
+        if not can_transition_status(current_status, status_update.status):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot transition incident from {current_status} to {status_update.status}"
+            )
+
         response = (
             supabase_admin
             .table("incidents")
@@ -415,13 +480,14 @@ def update_incident_status(
                 "status": status_update.status
             })
             .eq("id", incident_id)
+            .eq("status", current_status)
             .execute()
         )
 
         if not response.data:
             raise HTTPException(
-                status_code=404,
-                detail="Incident not found"
+                status_code=409,
+                detail="Incident status changed; refresh and retry"
             )
 
         return {
@@ -433,8 +499,8 @@ def update_incident_status(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("UPDATE INCIDENT STATUS ERROR:", e)
+    except Exception as exc:
+        logger.error("Incident status update failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -449,25 +515,34 @@ def update_incident_status(
 @app.put("/api/incidents/{incident_id}/analyze")
 def analyze_incident(
     incident_id: int,
-    analysis: IncidentAnalysis,
     current_user=Depends(
         require_role("RESCUER", "ADMIN")
     )
 ):
     """
-    Store AI/priority analysis results for an incident.
+    Produce an explainable rule-based triage result.
     """
 
     try:
+        incident_response = (
+            supabase_admin
+            .table("incidents")
+            .select("*")
+            .eq("id", incident_id)
+            .limit(1)
+            .execute()
+        )
+        if not incident_response.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Incident not found"
+            )
+
+        triage = analyze_incident_with_rules(incident_response.data[0])
         response = (
             supabase_admin
             .table("incidents")
-            .update({
-                "disaster_type": analysis.disaster_type,
-                "severity": analysis.severity,
-                "priority_score": analysis.priority_score,
-                "ai_confidence": analysis.ai_confidence
-            })
+            .update(triage)
             .eq("id", incident_id)
             .execute()
         )
@@ -480,15 +555,16 @@ def analyze_incident(
 
         return {
             "success": True,
-            "message": "Incident analysis updated successfully",
-            "incident": response.data[0]
+            "message": "Rule-based triage completed; no ML model was used",
+            "incident": response.data[0],
+            "analysis": triage,
         }
 
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("ANALYZE INCIDENT ERROR:", e)
+    except Exception as exc:
+        logger.error("Incident triage failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -520,11 +596,14 @@ def get_resources(
         return {
             "success": True,
             "count": len(response.data),
-            "resources": response.data
+            "resources": response.data,
+            "availability_note": (
+                "Availability is manually reported and may be stale."
+            ),
         }
 
-    except Exception as e:
-        print("GET RESOURCES ERROR:", e)
+    except Exception as exc:
+        logger.error("Resource lookup failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -581,8 +660,8 @@ def create_resource(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("CREATE RESOURCE ERROR:", e)
+    except Exception as exc:
+        logger.error("Resource creation failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -655,8 +734,8 @@ def update_resource(
     except HTTPException:
         raise
 
-    except Exception as e:
-        print("UPDATE RESOURCE ERROR:", e)
+    except Exception as exc:
+        logger.error("Resource update failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -678,18 +757,54 @@ def recommend_incident_resources(
     """
 
     try:
-        recommendations = recommend_resources(
+        recommended_types = recommend_resources(
             request.disaster_type,
             request.severity
         )
+        inventory_response = (
+            supabase_admin
+            .table("resources")
+            .select("*")
+            .in_("type", recommended_types)
+            .execute()
+        )
+        inventory = inventory_response.data or []
+        details = []
+        for resource_type in recommended_types:
+            matching = [
+                resource
+                for resource in inventory
+                if resource.get("type") == resource_type
+            ]
+            available = [
+                resource for resource in matching
+                if resource.get("available") is True
+            ]
+            details.append({
+                "resource_type": resource_type,
+                "available_count": len(available),
+                "available_resources": available,
+                "availability": (
+                    "reported_available"
+                    if available
+                    else "recorded_unavailable"
+                    if matching
+                    else "no_inventory_recorded"
+                ),
+            })
 
         return {
             "success": True,
-            "recommendations": recommendations
+            "recommendations": recommended_types,
+            "recommendation_details": details,
+            "availability_note": (
+                "Availability reflects recorded inventory only; "
+                "recommendations do not reserve or dispatch resources."
+            ),
         }
 
-    except Exception as e:
-        print("RESOURCE RECOMMENDATION ERROR:", e)
+    except Exception as exc:
+        logger.error("Resource recommendation failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,
@@ -713,7 +828,7 @@ def sync_offline_sos(
     """
 
     try:
-        incident_data = sos.model_dump()
+        incident_data = sos.model_dump(mode="json")
 
         result = sync_incident(
             incident_data=incident_data,
@@ -728,8 +843,8 @@ def sync_offline_sos(
             detail=str(e)
         )
 
-    except Exception as e:
-        print("SYNC ERROR:", e)
+    except Exception as exc:
+        logger.error("Offline SOS synchronization failed (%s)", type(exc).__name__)
 
         raise HTTPException(
             status_code=500,

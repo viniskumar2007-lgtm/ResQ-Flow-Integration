@@ -48,8 +48,9 @@ class ResourceModel(BaseModel):
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
-    available: bool = True
+    available: bool = False
 
     contact: Optional[str] = None
 
     created_at: Optional[str] = None
+    updated_at: Optional[str] = None
